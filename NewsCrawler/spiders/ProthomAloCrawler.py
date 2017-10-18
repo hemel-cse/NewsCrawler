@@ -1,23 +1,25 @@
 import scrapy
 import logging
 import datetime
+import re
+from dateutil import parser
 
 from NewsCrawler.items import ProthomAloItem
 from newspaper import Article
-
 from NewsCrawler.Helpers.CustomNERTagger import Tagger
+from NewsCrawler.Helpers.image_downloader import download_image
 from NewsCrawler.credentials_and_configs.stanford_ner_path import STANFORD_CLASSIFIER_PATH, STANFORD_NER_PATH
-
-from NewsCrawler.Helpers.date_helper import dateobject_to_split_date, DATETIME_FORMAT, increase_day_by_one
-
+from NewsCrawler.Helpers.date_helper import dateobject_to_split_date, DATETIME_FORMAT, increase_day_by_one, date_to_string, d2s
 from scrapy.exceptions import CloseSpider
-
 from elasticsearch import Elasticsearch
 from pymongo import MongoClient
+
+
 es = Elasticsearch()
 
+
 class ProthomAloSpider(scrapy.Spider):
-    name = 'prothomalo'
+    name="prothomalo"
 
     def __init__(self, start_date="01-07-2014", end_date="02-07-2014", delimiter='-'):
         self.start_day, self.start_month, self.start_year = dateobject_to_split_date(start_date, delimiter=delimiter)
@@ -38,9 +40,24 @@ class ProthomAloSpider(scrapy.Spider):
 
         self.id = 0
         client = MongoClient()
-        self.db = client.prothomalo_db
+        self.db = client.news_db
 
         yield scrapy.Request(self.url, self.parse)
+
+    # Formula for id = newspaper_name + published_date + crawled_date
+    def get_id(self, news_item, response):
+        news_item = response.meta['news_item']
+        # newspaper name
+        np = str(news_item['newspaper_name']).lower().replace(' ', '_')
+        # Date published
+        dp = d2s(parser.parse(news_item['published_date']))
+        # Date crawled
+        dc = d2s(news_item['crawl_time'], True)
+
+        id = np + '_' + dp + '_' + dc
+
+        news_item['_id'] = id
+        return news_item
     
     def parse(self, response):
         # Selecting the list of news
@@ -91,12 +108,12 @@ class ProthomAloSpider(scrapy.Spider):
     def parseNews(self, response):
         self.logger.info("TRYING")
         self.id += 1
-        
+
         # Retreiving news item
         news_item = response.meta['news_item']
 
-        # Inserting id
-        news_item['_id'] = self.id
+        # Crawl time
+        news_item['crawl_time'] = datetime.datetime.now()
 
         # Currently detects one image
         news_item['images'] = self.get_image_url(response.xpath("//img/@src").extract())
@@ -107,6 +124,9 @@ class ProthomAloSpider(scrapy.Spider):
         #Getting the article
         paragraphs = response.xpath("//div[@itemprop='articleBody']//p/text()").extract()
         news_item['article'] = "".join([para.strip() for para in paragraphs])
+
+        # Add a space after punctuation [This is required, otherwise tagging will combine two Named Entity into one]
+        re.sub(r'\.(?! )', '. ', re.sub(r' +', ' ', news_item['article']))
 
         # Getting the breadcrumb
         news_item['breadcrumb'] = response.xpath("//div[@class='breadcrumb']/ul/li/a/strong/text()").extract()
@@ -146,14 +166,19 @@ class ProthomAloSpider(scrapy.Spider):
 
         news_item['sentiment'] = self.tagger.get_indico_sentiment(news_item['article'])
 
+        news_item = self.get_id(news_item, response)
+
+        # If image exists, download it
+        if news_item['images'] != None:
+            download_image(news_item)
+
         doc = {
             "id" : news_item['_id'],
             "news_url" : news_item['url'],
             "newspaper" : news_item['newspaper_name'],
             "reporter" : news_item['reporter'],
             "about_reporter" : None,
-            "published" : news_item['published_date'],
-            # "last_update" : news_item['published_date'],
+            "date_published" : parser.parse(news_item['published_date']),
             "title" : news_item['title'],
             "content" : news_item['article'],
             "top_tagline" : None,
@@ -168,31 +193,30 @@ class ProthomAloSpider(scrapy.Spider):
             "shoulder" : None,
             "section" : news_item['category'],
             
-            "ner_person" : news_item['ner_person'],
-            "ner_organization" : news_item['ner_organization'],
-            "ner_money" : news_item['ner_money'],
-            "ner_time" : news_item['ner_time'],
-            "ner_location" : news_item['ner_location'],
-            "ner_percent" : news_item['ner_percent'],
+            "ner_unique_person" : news_item['ner_person'],
+            "ner_unique_organization" : news_item['ner_organization'],
+            "ner_unique_money" : news_item['ner_money'],
+            "ner_unique_time" : news_item['ner_time'],
+            "ner_unique_location" : news_item['ner_location'],
+            "ner_unique_percent" : news_item['ner_percent'],
 
-            "ner_list_person" : news_item['ner_list_person'],
-            "ner_list_organization" : news_item['ner_list_organization'],
-            "ner_list_money" : news_item['ner_list_money'],
-            "ner_list_time" : news_item['ner_list_time'],
-            "ner_list_location" : news_item['ner_list_location'],
-            "ner_list_percent" : news_item['ner_list_percent'],
+            "ner_person" : news_item['ner_list_person'],
+            "ner_organization" : news_item['ner_list_organization'],
+            "ner_money" : news_item['ner_list_money'],
+            "ner_time" : news_item['ner_list_time'],
+            "ner_location" : news_item['ner_list_location'],
+            "ner_percent" : news_item['ner_list_percent'],
 
             "generated_keywords" : news_item['generated_keywords'],
             "generated_summary" : news_item['generated_summary'],
-            "crawled_time" : datetime.datetime.now().strftime(DATETIME_FORMAT),
-            "@timestamp" : datetime.datetime.now().strftime(DATETIME_FORMAT),
+            "date_crawled" : datetime.datetime.now()
         }
 
         # Inserting data to Elasticsearch
-        res = es.index(index="newspaper_index", doc_type="news", id=self.id, body=doc)
+        res = es.index(index="newspaper_index", doc_type="news", body=doc)
         # Inserting data into mongodb
-        self.db.prothomalo_db.insert_one(doc)
-
+        self.db.news_db.insert_one(doc)
+        self.logger.info(res)
         # Output can also be saved as csv/json
         yield doc
     
